@@ -39,7 +39,7 @@ except ImportError:
     _compute_gradient_field_impl = None
     _analyze_convergence_impl = None
 
-mcp = FastMCP("origami-aesthetics")
+mcp = FastMCP("origami-aesthetics-mcp")
 
 # Version tracking for Phase 2.7
 SERVER_VERSION = "1.3.0-phase2.7"
