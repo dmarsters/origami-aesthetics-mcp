@@ -21,6 +21,8 @@ Categorical framework:
 from fastmcp import FastMCP
 from typing import Literal, Optional
 from enum import Enum
+import math
+import re
 import numpy as np
 
 
@@ -39,11 +41,11 @@ except ImportError:
     _compute_gradient_field_impl = None
     _analyze_convergence_impl = None
 
-mcp = FastMCP("origami-aesthetics-mcp")
+mcp = FastMCP("origami-aesthetics")
 
 # Version tracking for Phase 2.7
-SERVER_VERSION = "1.3.0-phase2.7"
-VALIDATION_DATE = "2026-02-06"
+SERVER_VERSION = "1.4.0-phase2.8-decompose"
+VALIDATION_DATE = "2026-02-21"
 
 # =============================================================================
 # DETERMINISTIC TAXONOMY - Core origami vocabulary
@@ -2558,6 +2560,291 @@ def analyze_strategy_document_tool(strategy_text: str) -> dict:
 
 
 # =============================================================================
+# AESTHETIC DECOMPOSITION — Inverse pipeline: description → coordinates
+# =============================================================================
+# Layer 2: deterministic, 0 LLM tokens.
+# Uses keyword matching against ORIGAMI_VISUAL_VOCABULARY to recover
+# 5D coordinates from a text description of an image or aesthetic.
+#
+# Algorithm:
+#   1. Tokenize description into words + keep full lowercase text
+#   2. Score each visual type by keyword fragment matching + color/optical
+#   3. Softmax scores → blend weights → weighted average of type centers
+#   4. Confidence = max_score / max_possible_score
+#
+# This completes the round-trip:
+#   coordinates → prompt → image → description → coordinates
+# =============================================================================
+
+_DECOMPOSE_STOP_WORDS = frozenset({
+    'a', 'an', 'the', 'in', 'on', 'at', 'to', 'of', 'for', 'with',
+    'by', 'from', 'and', 'or', 'but', 'as', 'is', 'are', 'was', 'were',
+    'be', 'been', 'being', 'has', 'have', 'had', 'do', 'does', 'did',
+    'no', 'not', 'all', 'its', 'this', 'that', 'into', 'over',
+})
+
+# Tuning constants
+_SUBSTRING_WEIGHT = 1.0     # Full fragment found in text
+_WORD_OVERLAP_WEIGHT = 0.3  # Individual word from fragment found
+_SOFTMAX_TEMP = 1.5         # Higher = more uniform blending
+_MIN_CONFIDENCE = 0.05      # Below this, domain not detected
+
+
+def _decompose_extract_fragments(keyword: str) -> list[str]:
+    """Extract matchable sub-phrases from a keyword string.
+
+    Sliding window of 2-4 words, plus full keyword if 3+ words.
+    Skips fragments that are mostly stop words.
+    """
+    words = keyword.lower().split()
+    fragments = []
+    if len(words) >= 3:
+        fragments.append(keyword.lower())
+    for window_size in [4, 3, 2]:
+        for i in range(len(words) - window_size + 1):
+            frag_words = words[i:i + window_size]
+            content = [w for w in frag_words
+                       if len(w) > 3 and w not in _DECOMPOSE_STOP_WORDS]
+            if content:
+                fragments.append(' '.join(frag_words))
+    return fragments
+
+
+def _decompose_score_type(keywords: list[str], word_set: set[str],
+                          full_text: str) -> tuple[float, list[str]]:
+    """Score a visual type's keywords against input text.
+
+    Returns (score, list_of_matched_fragments).
+    """
+    score = 0.0
+    matched = []
+    for keyword in keywords:
+        fragments = _decompose_extract_fragments(keyword)
+        best_score = 0.0
+        best_frag = None
+        for frag in fragments:
+            if frag in full_text:
+                if _SUBSTRING_WEIGHT > best_score:
+                    best_score = _SUBSTRING_WEIGHT
+                    best_frag = frag
+            else:
+                frag_words = set(frag.split()) - _DECOMPOSE_STOP_WORDS
+                if frag_words:
+                    overlap = len(frag_words & word_set) / len(frag_words)
+                    ws = overlap * _WORD_OVERLAP_WEIGHT
+                    if ws > best_score:
+                        best_score = ws
+                        best_frag = frag
+        if best_frag and best_score > 0:
+            score += best_score
+            matched.append(best_frag)
+    return score, matched
+
+
+def _decompose_softmax(scores: dict[str, float]) -> dict[str, float]:
+    """Softmax with temperature over type scores."""
+    if not scores or max(scores.values()) == 0:
+        n = len(scores)
+        return {k: 1.0 / n for k in scores} if n > 0 else {}
+    max_s = max(scores.values())
+    exps = {k: math.exp((v - max_s) / _SOFTMAX_TEMP) for k, v in scores.items()}
+    total = sum(exps.values())
+    return {k: v / total for k, v in exps.items()}
+
+
+def _decompose_origami(description: str) -> dict:
+    """Core decomposition: description text → origami 5D coordinates.
+
+    Layer 2: deterministic, 0 LLM tokens.
+
+    Args:
+        description: Image description or aesthetic text.
+
+    Returns:
+        Dict with coordinates, confidence, nearest_type, metadata.
+    """
+    lower = description.lower()
+    words = set(re.findall(r'[a-z]+(?:-[a-z]+)*', lower))
+
+    # Score each visual vocabulary type
+    type_scores: dict[str, float] = {}
+    type_matches: dict[str, list[str]] = {}
+
+    for type_id, type_data in ORIGAMI_VISUAL_VOCABULARY.items():
+        score, matched = _decompose_score_type(
+            type_data["keywords"], words, lower
+        )
+        type_scores[type_id] = score
+        type_matches[type_id] = matched
+
+    max_score = max(type_scores.values()) if type_scores else 0
+    # Max possible: 7 keywords × 1.0 = 7.0
+    max_possible = 7.0 * _SUBSTRING_WEIGHT
+    confidence = min(1.0, max_score / max_possible) if max_possible > 0 else 0.0
+
+    if confidence < _MIN_CONFIDENCE:
+        return {
+            "domain_id": "origami",
+            "coordinates": {p: 0.5 for p in ORIGAMI_PARAMETER_NAMES},
+            "confidence": 0.0,
+            "nearest_type": "",
+            "nearest_type_distance": float('inf'),
+            "type_scores": {k: round(v, 3) for k, v in type_scores.items()},
+            "type_weights": {},
+            "matched_fragments": [],
+            "detection": "below_threshold",
+        }
+
+    # Blend coordinates via softmax weights
+    weights = _decompose_softmax(type_scores)
+    coordinates = {p: 0.0 for p in ORIGAMI_PARAMETER_NAMES}
+    for type_id, type_data in ORIGAMI_VISUAL_VOCABULARY.items():
+        w = weights.get(type_id, 0)
+        if w > 0:
+            for p in ORIGAMI_PARAMETER_NAMES:
+                coordinates[p] += w * type_data["coords"].get(p, 0.5)
+
+    # Nearest type and distance
+    nearest_type = max(type_scores, key=type_scores.get)
+    nearest_center = ORIGAMI_VISUAL_VOCABULARY[nearest_type]["coords"]
+    nearest_dist = math.sqrt(sum(
+        (coordinates.get(p, 0) - nearest_center.get(p, 0)) ** 2
+        for p in ORIGAMI_PARAMETER_NAMES
+    ))
+
+    # Collect all matched fragments (deduplicated)
+    all_matched = []
+    for m_list in type_matches.values():
+        all_matched.extend(m_list)
+    unique_matched = list(dict.fromkeys(all_matched))
+
+    return {
+        "domain_id": "origami",
+        "coordinates": {k: round(v, 4) for k, v in coordinates.items()},
+        "confidence": round(confidence, 4),
+        "nearest_type": nearest_type,
+        "nearest_type_distance": round(nearest_dist, 4),
+        "type_scores": {k: round(v, 3) for k, v in type_scores.items()},
+        "type_weights": {k: round(v, 4) for k, v in weights.items()},
+        "matched_fragments": unique_matched,
+    }
+
+
+def _decompose_round_trip_fidelity() -> dict:
+    """Test decomposition fidelity by round-tripping through visual types.
+
+    For each type: use its keywords as description → decompose → compare
+    recovered coordinates to original center.
+
+    Returns summary with per-type accuracy and reconstruction error.
+    """
+    results = []
+    for type_id, type_data in ORIGAMI_VISUAL_VOCABULARY.items():
+        description = ". ".join(type_data["keywords"])
+        result = _decompose_origami(description)
+        center = type_data["coords"]
+        param_errors = {}
+        for p in ORIGAMI_PARAMETER_NAMES:
+            param_errors[p] = abs(center.get(p, 0) - result["coordinates"].get(p, 0))
+        recon_error = sum(param_errors.values()) / len(param_errors)
+        results.append({
+            "type_id": type_id,
+            "confidence": result["confidence"],
+            "nearest_type": result["nearest_type"],
+            "correct_nearest": result["nearest_type"] == type_id,
+            "reconstruction_error": round(recon_error, 4),
+            "param_errors": {k: round(v, 4) for k, v in param_errors.items()},
+            "matched_count": len(result["matched_fragments"]),
+        })
+    correct = sum(1 for r in results if r["correct_nearest"])
+    avg_err = sum(r["reconstruction_error"] for r in results) / len(results)
+    return {
+        "domain_id": "origami",
+        "total_types": len(results),
+        "correct_nearest_count": correct,
+        "nearest_accuracy": round(correct / len(results), 3),
+        "mean_reconstruction_error": round(avg_err, 4),
+        "per_type_results": results,
+    }
+
+
+@mcp.tool()
+def decompose_origami_from_description(description: str) -> dict:
+    """Decompose a text description into origami aesthetic 5D coordinates.
+
+    INVERSE PIPELINE TOOL: Given a description of an image or aesthetic
+    (from Claude vision output, user text, or any description of a visual
+    artifact), recovers the origami domain coordinates.
+
+    Completes the round-trip:
+        coordinates → prompt → image → description → coordinates
+
+    Uses keyword matching against the 5 origami visual vocabulary types
+    (traditional_crane, modular_kusudama, wet_fold_organic,
+    tessellation_surface, architectural_sculptural).
+
+    Layer 2: deterministic, 0 LLM tokens.
+
+    Args:
+        description: Image description text or aesthetic description.
+            Can be Claude vision output, user-written, or any text
+            describing origami-like visual qualities.
+
+    Returns:
+        Dict with:
+        - coordinates: 5D origami parameter values
+            (edge_sharpness, fold_accuracy, complexity_level,
+             organic_quality, dimensional_depth)
+        - confidence: 0-1 how much origami vocabulary was detected
+        - nearest_type: Best-matching visual vocabulary type
+        - nearest_type_distance: Distance from blended result to nearest center
+        - type_scores: Raw score per visual type
+        - type_weights: Softmax weights used for coordinate blending
+        - matched_fragments: Which keyword fragments matched
+
+    Example:
+        >>> decompose_origami_from_description(
+        ...     "crisp paper folds forming a traditional crane shape "
+        ...     "with clean mountain and valley creases, bilateral symmetry"
+        ... )
+        {
+            "coordinates": {"edge_sharpness": 0.90, "fold_accuracy": 0.95, ...},
+            "confidence": 0.43,
+            "nearest_type": "traditional_crane",
+            ...
+        }
+
+    Cost: 0 tokens (pure Layer 2 deterministic keyword matching)
+    """
+    return _decompose_origami(description)
+
+
+@mcp.tool()
+def validate_origami_decomposition_fidelity() -> dict:
+    """Test round-trip fidelity of the origami decomposition engine.
+
+    For each of the 5 visual vocabulary types:
+      1. Uses the type's own keywords as a test description
+      2. Decomposes → recovers coordinates
+      3. Compares to the type's known center coordinates
+      4. Reports nearest-type accuracy and reconstruction error
+
+    This is the cheapest possible fidelity test: if the decomposer
+    can't recover coordinates from the keywords that DEFINE each type,
+    it cannot handle real image descriptions.
+
+    Layer 2: deterministic, 0 LLM tokens.
+
+    Returns:
+        Dict with nearest_accuracy (0-1), mean_reconstruction_error,
+        and per-type breakdown.
+
+    Cost: 0 tokens
+    """
+    return _decompose_round_trip_fidelity()
+
+
+# =============================================================================
 # SERVER INFO
 # =============================================================================
 
@@ -2609,6 +2896,10 @@ def get_server_info() -> dict:
             ],
             "tomographic": [
                 "Strategy document analysis"
+            ],
+            "decomposition": [
+                "decompose_origami_from_description - Description → 5D coordinates (Layer 2)",
+                "validate_origami_decomposition_fidelity - Round-trip fidelity test (Layer 2)"
             ]
         },
         "morphospace": {
@@ -2674,6 +2965,18 @@ def get_server_info() -> dict:
                     "Domain registry integration for emergent attractor system"
                 ],
                 "matching_method": "Euclidean nearest-neighbor in 5D parameter space"
+            },
+            "phase_2_8_decomposition": {
+                "available": True,
+                "description": "Inverse pipeline: text description → 5D origami coordinates",
+                "algorithm": "Keyword fragment matching + softmax blending of visual type centers",
+                "visual_types_used": list(ORIGAMI_VISUAL_VOCABULARY.keys()),
+                "tools": [
+                    "decompose_origami_from_description",
+                    "validate_origami_decomposition_fidelity"
+                ],
+                "cost": "0 tokens (pure Layer 2 deterministic)",
+                "completes_round_trip": "coordinates → prompt → image → description → coordinates"
             }
         },
         "compatible_bricks": [
@@ -2689,7 +2992,9 @@ def get_server_info() -> dict:
             "Bounds: parameters stay within [0, 1]",
             "Aesthetic coherence: intermediate states are meaningful",
             "Vocabulary extraction: canonical states match at distance ≈ 0.0",
-            "Prompt generation: all modes produce valid output"
+            "Prompt generation: all modes produce valid output",
+            "Decomposition: keyword → nearest-type recovery accuracy",
+            "Decomposition: coordinate reconstruction error from type keywords"
         ],
         "usage_example": """
 # Phase 1A: Compute trajectory from precise to organic
